@@ -1,116 +1,52 @@
-# Emmy Hackathon — write a PTX compiler for Kernel IR
+# Emmy Kernel IR -> PTX compiler
 
-Emmy (github.com/cloudrift-ai/emmy) compiles PyTorch to CUDA C++ and builds it with `nvcc`.
-**Your task: write a compiler that takes Emmy's Kernel IR and emits PTX directly**, skipping the
-CUDA C++ step. `ptxas` turns PTX into the same GPU binary ~19× faster than the full `nvcc`
-pipeline — Emmy's autotuner compiles thousands of kernel variants, so that middle step matters.
-
-You do **not** need a GPU. A hosted runner at `http://runner.riftstack.ai:48701` (the default in `submit.py`) compiles
-your PTX with `ptxas`, executes it on real hardware, and tells you whether the output is correct. See [docs/API.md](docs/API.md).
-
-## Requirements
-
-- **Python 3.12 or newer.** The Kernel IR only deserializes through Emmy's own classes:
-
-  ```bash
-  pip install emmy-ml==0.3.11       # no torch, no CUDA, no GPU needed
-  ```
-
-  This alone reads every problem IR. Torch is **not** needed — it is only required to
-  *generate* new IRs from PyTorch expressions, which is optional.
-
-- Your submission is a **program**, not PTX files. It must run as:
-
-  ```bash
-  python compile.py path/to/kernel.ir.json > out.ptx
-  ```
-
-  This contract matters: submissions are evaluated against a **hidden set** of Kernel IRs in the
-  same categories as the open problems. Hardcoding the open set scores nothing.
-
-## Five-minute start
+A compiler from Emmy's Kernel IR straight to PTX, for the
+[Emmy Hackathon 2026](https://github.com/cloudrift-ai/emmy-hackathon-2026) (task: [TASK.md](TASK.md)).
 
 ```bash
-git clone https://github.com/cloudrift-ai/emmy-hackathon-2026 && cd emmy-hackathon-2026
-pip install emmy-ml==0.3.11 numpy requests   # no torch needed
-python submit.py r01_array_sum examples/k_sum_1_reduce.ptx    # see a pass
-python submit.py p00_scalar_add examples/k_sum_1_reduce.ptx   # wrong entry: a clean failure
-python submit.py p00_scalar_add --compiler compile.py         # your compiler, once you have one
+pip install emmy-ml==0.3.11            # the only dependency: loads the IR
+python compile.py path/to/kernel.ir.json > out.ptx
 ```
 
-Then open `problems/p00_scalar_add/` and look at three files:
+`compile.py` imports only emmy (to deserialize the IR with `Graph.from_dict`) and the Python
+standard library. The IR -> PTX lowering is all in that one file; no emmy renderer, nvcc or
+other compiler is involved.
 
-| file | what it is |
+## How it works
+
+1. **Load.** `Graph.from_dict` gives the typed `KernelOp`. The `meta.json` next to the IR gives
+   the parameter order (`arg_order`), buffer shapes and the launch geometry.
+2. **Prescan.** Collect shared arrays (static, or one dynamic pool above 48 KiB) and the
+   buffers the kernel writes (the others are read through `ld.global.nc`).
+3. **Walk.** Each IR statement kind has one method, `s_<Kind>`, that appends PTX lines.
+   Index expressions are compiled recursively by `expr()`, with constant folding. `env` maps
+   IR names to virtual registers (`%f` float, `%r` int, `%rd` address, `%p` predicate).
+4. **Emit.** Header, shared declarations, signature, register counts, body. ptxas does the real
+   register allocation.
+
+| IR | PTX |
 |---|---|
-| `*.ir.json` | the Kernel IR — **the input to your compiler** |
-| `*.ir.txt` | the same IR, pretty-printed for reading |
-| `*.ref.cu` | Emmy's generated CUDA C++ — the reference answer, in a different target language |
+| `Tile` | `gid = ctaid*ntid + tid`, a bounds guard when the launch has more threads than cells, row-major axis decode (plus emmy's grouped CTA rasterization) |
+| `Load` / `Write` | flattened row-major offset; `ld/st.v2/.v4` for grouped values; `red.global.add` for atomic writes |
+| `Assign` | one instruction (`add.f32`, `max.f32`, `rcp.rn.f32` ...) or a short sequence (`exp` = `ex2.approx(x*log2e)`, `tanh`, `erf`, `gelu`, `pow` ...) |
+| `Accum` / `Init` | a register updated in place, seeded with the op's identity before the loop over its reduced axis |
+| `Loop` / `StridedLoop` | counter + `setp` + `bra`; fully unrolled when the IR asks and the body is small |
+| `Cond` | `setp` + `@!p bra` |
+| `WarpShuffle` | `shfl.sync.bfly.b32` butterfly, then the IR's combine statements |
+| `Smem` / `Sync` / `TreeHalve` | `.shared` arrays, `bar.sync`, shared-memory halving tree + broadcast |
+| `CpAsyncCopy/Commit/Wait` | `cp.async.cg/ca.shared.global`, `cp.async.commit_group`, `cp.async.wait_group` |
 
-Load an IR in Python:
+## Testing (dev tools, not part of the compiler)
 
-```python
-import json
-from emmy.compiler.graph import Graph
-g = Graph.from_dict(json.load(open("problems/r01_array_sum/k_sum_1_reduce.ir.json")))
-body = g.nodes["sum_1"].op.body     # a tree of typed statements: Tile, StridedLoop, Load, ...
+```bash
+python submit.py r01_array_sum --compiler compile.py    # one problem on the hosted runner
+python tools/test.py                                    # every problem on a local GPU: metrics table
+python tools/test.py --remote                           # every problem on the hosted runner
 ```
 
-Your compiler walks that tree and prints PTX. Start with the common node kinds in the short table —
-see [TASK.md](TASK.md) for the categories and the node-by-node translation table.
-
-## The problems
-
-15 open problems in 5 categories, easy → hard: **pointwise → reductions → matmul → fused →
-attention-like**. Each is a folder under `problems/` with the IR, the reference, a launch
-descriptor (`meta.json` — you never guess grid/block), and expected outputs (`expected.npz`).
-
-**MVP: your compiler passes categories 1 and 2.** See [MVP.md](MVP.md).
-
-Problems are scheduled for `sm_89`, and the runner is an **RTX 5090 (`sm_120`)**, where PTX written for `sm_89`
-runs unchanged; [problems/PROVENANCE.md](problems/PROVENANCE.md)
-says how they were generated and checked. The hidden evaluation set contains more problems of the *same kinds* —
-different shapes and ops, no surprise concepts.
-
-## Submitting
-
-Submit at [riftstack.ai/hackathon/submit](https://riftstack.ai/hackathon/submit) before
-**23:59 AoE on Tuesday, October 27**. A submission is:
-
-- a **public GitHub repository** with `compile.py` at its root, runnable as
-  `python compile.py path/to/kernel.ir.json > out.ptx`;
-- a **video of 3 to 5 minutes** in which you walk through your compiler in your own voice
-  (YouTube, Vimeo or Google Drive, shared so that anyone with the link can watch it).
-
-Teams of up to three submit once and list every member. You can submit again until the
-deadline; we review your latest entry. AI coding assistants are allowed, but your video has to
-show that you understand how your compiler works — an entry where the understanding seems to
-have been handed to an AI is not eligible for a prize.
-
-## How compilers are evaluated
-
-We run your `compile.py` on every kernel of the **hidden set** — the same five categories as the
-open problems, with different shapes and ops — then assemble the PTX with `ptxas`, run it on the
-runner's GPU under each problem's `meta.json` launch, and compare the outputs with the expected
-ones within the problem's tolerance. This is the pipeline `submit.py --compiler` runs, so passing
-the open set that way is the best preparation. Keep compiling to seconds per kernel: a time
-limit may apply.
-
-1. **Correctness on the hidden set, by category.** Passing categories 1 and 2 is the bar
-   ([MVP.md](MVP.md)); each further category is what sets submissions apart.
-2. **Code review** of your compiler is the first tiebreak. The IR → PTX lowering has to be your
-   own — see the rule in [TASK.md](TASK.md).
-3. **Speed** of the generated kernels is the last tiebreak.
-
-The video decides prize eligibility, as described above.
-
-## Repo map
-
-```
-problems/     the open set (15 problems)
-examples/     hand-written PTX with comments mapping each block back to the IR
-submit.py     one-command test: compile + run + check against expected outputs
-docs/API.md   the runner API, if you want to call it directly
-tools/        how the problems were generated (emmy compile -c ... --ir cuda)
-TASK.md       the task, the categories, the CLI contract
-MVP.md        the minimum bar
-```
+`tools/test.py` reports ptxas acceptance, pass/fail, error headroom (max error / tolerance),
+compile time, registers, spills and kernel time, and appends a summary to
+`metrics/history.jsonl`. `tools/expressions_corpus.py` and `tools/expressions_ragged.py` hold
+about 100 extra torch expressions (new shapes and ops, tiny and ragged tails) used as a stand-in
+for the hidden set, generated with `tools/generate.py`. `tools/dev/` has the Windows shims
+needed to run emmy's CLI there.
