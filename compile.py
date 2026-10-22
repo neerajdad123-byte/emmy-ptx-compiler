@@ -18,6 +18,7 @@ ptxas does the real allocation.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import math
 import struct
 import sys
@@ -27,6 +28,7 @@ from emmy.compiler.graph import Graph
 
 PTX_VERSION, TARGET = "8.0", "sm_89"
 STATIC_SMEM_LIMIT = 48 * 1024           # above this, shared arrays live in one dynamic pool
+RUNTIME_UNROLL = 4                      # copies per trip of a small runtime loop
 UNROLL_LIMIT = 4096                     # max statements emitted when honoring Loop.unroll
 SMEM_BYTES = {"float": 4, "f32": 4}
 LOG2E, LN2 = "0f3FB8AA3B", "0f3F317218"
@@ -34,6 +36,26 @@ LOG2E, LN2 = "0f3FB8AA3B", "0f3F317218"
 
 class Unsupported(Exception):
     pass
+
+
+class Lin:
+    """Affine integer form sum(coeff * register) + c, so indices fold, cancel and share."""
+
+    def __init__(self, t: dict[str, int] | None = None, c: int = 0):
+        self.t = {r: k for r, k in (t or {}).items() if k}
+        self.c = c
+
+    def __add__(self, o: "Lin") -> "Lin":
+        t = dict(self.t)
+        for r, k in o.t.items():
+            t[r] = t.get(r, 0) + k
+        return Lin(t, self.c + o.c)
+
+    def scale(self, k: int) -> "Lin":
+        return Lin({r: v * k for r, v in self.t.items()}, self.c * k)
+
+    def divisible(self, d: int) -> bool:
+        return all(v % d == 0 for v in self.t.values())
 
 
 def f32(x: float) -> str:
@@ -62,6 +84,7 @@ def c_div(a: int, b: int) -> int:     # C semantics: truncate toward zero
 INT_BIN = {"+": "add.s32", "-": "sub.s32", "*": "mul.lo.s32", "/": "div.s32", "//": "div.s32",
            "%": "rem.s32", "<<": "shl.b32", ">>": "shr.s32", "&": "and.b32", "|": "or.b32", "^": "xor.b32",
            "min": "min.s32", "max": "max.s32"}
+ARITH = ("+", "-", "*", "/", "//", "%")
 INT_CMP = {"<": "lt", "<=": "le", ">": "gt", ">=": "ge", "==": "eq", "!=": "ne"}
 PRED_BIN = {"&&": "and.pred", "and": "and.pred", "||": "or.pred", "or": "or.pred"}
 FOLD = {"+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
@@ -113,6 +136,9 @@ class Kernel:
         self.declared: set[str] = set()   # accumulators seeded by Init
         self.acc_owner: dict[str, str] = {}   # accumulator -> loop axis that seeded it
         self.written: set[str] = set()
+        self.memo: dict = {}              # value numbering: (op, a, b) -> register
+        self.nn: set[str] = set()         # integer registers known to be >= 0
+        self.linv: dict[str, Lin] = {}    # loop variables bound to an affine form
 
     # ---- small helpers ---------------------------------------------------
     def new(self, k: str) -> str:
@@ -131,6 +157,7 @@ class Kernel:
 
     def bind(self, name: str, reg: str, k: str) -> None:
         self.env[name], self.kind[name] = reg, k
+        self.linv.pop(name, None)
 
     def dest(self, name: str, k: str = "f") -> str:
         """Register for a value being (re)defined: reuse the name's register so loop-carried
@@ -155,26 +182,98 @@ class Kernel:
         return r
 
     # ---- integer expressions ---------------------------------------------
+    @contextmanager
+    def scope(self):
+        """Values numbered inside a branch or loop body are not available after it."""
+        saved = dict(self.memo)
+        yield
+        self.memo = saved
+
+    def isnn(self, x: str) -> bool:
+        return int(x) >= 0 if is_imm(x) else x in self.nn
+
     def iop(self, op: str, a: str, b: str) -> tuple[str, str]:
+        """Emit one integer instruction, value-numbered: the same (op, a, b) is computed once."""
         if is_imm(a) and is_imm(b) and op in FOLD:
             return str(FOLD[op](int(a), int(b))), "r"
-        if op in ("+", "-") and b == "0" or op in ("*", "/") and b == "1":
+        if op in ("+", "-") and b == "0" or op in ("*", "/", "//") and b == "1":
             return a, "r"
         if op == "+" and a == "0" or op == "*" and a == "1":
             return b, "r"
         if op == "*" and "0" in (a, b):
             return "0", "r"
-        if op in INT_CMP:
-            p = self.new("p")
-            self.emit(f"setp.{INT_CMP[op]}.s32 {p}, {self.reg(a)}, {b};")
-            return p, "p"
-        if op not in INT_BIN:
-            raise Unsupported(f"integer operator {op!r}")
         if is_imm(a) and op in ("+", "*", "&", "|", "^", "min", "max"):
             a, b = b, a
+        key = (op, a, b)
+        if key in self.memo:
+            return self.memo[key], "p" if op in INT_CMP else "r"
+        nn = self.isnn(a) and self.isnn(b)
+        if op in INT_CMP:
+            d = self.new("p")
+            self.emit(f"setp.{INT_CMP[op]}.s32 {d}, {self.reg(a)}, {b};")
+            self.memo[key] = d
+            return d, "p"
+        if op not in INT_BIN:
+            raise Unsupported(f"integer operator {op!r}")
+        ins = INT_BIN[op]
+        if nn and op in ("/", "//", "%"):   # non-negative: unsigned, and shifts/masks for 2^k
+            pow2 = is_imm(b) and int(b) > 0 and int(b) & (int(b) - 1) == 0
+            if pow2:
+                ins, b = ("and.b32", str(int(b) - 1)) if op == "%" else ("shr.u32", str(int(b).bit_length() - 1))
+            else:
+                ins = "rem.u32" if op == "%" else "div.u32"
         d = self.new("r")
-        self.emit(f"{INT_BIN[op]} {d}, {self.reg(a)}, {b};")
+        self.emit(f"{ins} {d}, {self.reg(a)}, {b};")
+        if nn and op in ("+", "*", "/", "//", "%", ">>", "&", "min", "max"):
+            self.nn.add(d)
+        self.memo[key] = d
         return d, "r"
+
+    def lin(self, e) -> Lin:
+        """Integer expression as an affine form; non-affine parts become register atoms."""
+        t = type(e).__name__
+        if t == "Literal" and not (isinstance(e.value, float) and not float(e.value).is_integer()):
+            return Lin(c=int(e.value))
+        if e.__class__.__name__ == "Var" and e.name in self.linv:
+            return self.linv[e.name]
+        if t == "Var" and self.kind.get(e.name) == "r":
+            x = self.val(e.name)
+            return Lin(c=int(x)) if is_imm(x) else Lin({x: 1})
+        if t == "BinaryExpr" and e.op in ARITH:
+            a, b = self.lin(e.left), self.lin(e.right)
+            if e.op == "+":
+                return a + b
+            if e.op == "-":
+                return a + b.scale(-1)
+            if e.op == "*" and (not b.t or not a.t):
+                return a.scale(b.c) if not b.t else b.scale(a.c)
+            if e.op in ("/", "//", "%") and not b.t and b.c > 0 and a.divisible(b.c) and self.lin_nn(a):
+                # (d*m + c) / d = m + c // d and (d*m + c) % d = c % d, since the total is >= 0
+                if e.op == "%":
+                    return Lin(c=a.c % b.c)
+                return Lin({r: k // b.c for r, k in a.t.items()}, a.c // b.c)
+            x, _ = self.iop(e.op, self.mat(a), self.mat(b))
+            return Lin(c=int(x)) if is_imm(x) else Lin({x: 1})
+        x, k = self.expr(e)
+        if k != "r":
+            raise Unsupported(f"non-integer index {fmt(e)}")
+        return Lin(c=int(x)) if is_imm(x) else Lin({x: 1})
+
+    def lin_nn(self, a: Lin) -> bool:
+        return a.c >= 0 and all(k > 0 and r in self.nn for r, k in a.t.items())
+
+    def mat(self, a: Lin) -> str:
+        """Materialize an affine form: positive terms first, then subtractions, then the constant."""
+        if not a.t:
+            return str(a.c)
+        acc = None
+        for r, k in sorted(a.t.items(), key=lambda rk: (rk[1] < 0, rk[0])):
+            term = r if abs(k) == 1 else self.iop("*", r, str(abs(k)))[0]
+            if acc is None:
+                acc = term if k > 0 else self.iop("-", "0", term)[0]
+            else:
+                acc = self.iop("+" if k > 0 else "-", acc, term)[0]
+        return self.iop("+", acc, str(a.c))[0] if a.c else acc
 
     def expr(self, e) -> tuple[str, str]:
         t = type(e).__name__
@@ -183,8 +282,12 @@ class Kernel:
                 return f32(e.value), "f"
             return str(int(e.value)), "r"
         if t == "Var":
+            if self.kind.get(e.name) == "r":
+                return self.mat(self.lin(e)), "r"
             return self.val(e.name), self.kind[e.name]
         if t == "BinaryExpr":
+            if e.op in ARITH:
+                return self.mat(self.lin(e)), "r"
             if e.op in PRED_BIN:
                 a, b = self.pred(e.left), self.pred(e.right)
                 p = self.new("p")
@@ -215,38 +318,40 @@ class Kernel:
         return p
 
     # ---- addressing --------------------------------------------------------
-    def offset(self, index, shape) -> str:
+    def offset(self, index, shape) -> Lin:
         """Row-major element offset of `index` in a buffer of `shape`."""
         index, shape = list(index), list(shape)
-        if not index:
-            return "0"
         shape = shape[len(shape) - len(index):] if len(shape) >= len(index) else \
             [1] * (len(index) - len(shape)) + shape
-        off, stride = "0", 1
+        off, stride = Lin(), 1
         for i, ext in zip(reversed(index), reversed(shape)):
-            term, _ = self.iop("*", self.expr(i)[0], str(stride))
-            off, _ = self.iop("+", off, term)
+            off = off + self.lin(i).scale(stride)
             stride *= ext
         return off
 
-    def address(self, buf: str, off: str) -> tuple[str, int]:
-        """(base register or symbol, byte displacement) of element `off` of `buf`."""
+    def address(self, buf: str, off: Lin | str) -> tuple[str, int]:
+        """(base register or symbol, byte displacement) of element `off` of `buf`; the constant
+        part of the offset goes into the displacement, so unrolled accesses share one register."""
         b = self.bufs.get(buf)
         if b is None:
             raise Unsupported(f"unknown buffer {buf!r}")
-        eb = b["bytes"]
-        if b["space"] == "global":
-            if is_imm(off):
-                return b["base"], int(off) * eb
-            w, a = self.new("rd"), self.new("rd")
-            self.emit(f"mul.wide.s32 {w}, {off}, {eb};")
-            self.emit(f"add.s64 {a}, {b['base']}, {w};")
-            return a, 0
-        if is_imm(off):
-            return b["sym"], b["pool_off"] + int(off) * eb
-        a = self.new("r")
-        self.emit(f"mad.lo.s32 {a}, {off}, {eb}, {self.smem_base(buf)};")
-        return a, 0
+        if isinstance(off, str):
+            off = Lin(c=int(off)) if is_imm(off) else Lin({off: 1})
+        eb, disp = b["bytes"], off.c * b["bytes"]
+        if not off.t:
+            return (b["base"], disp) if b["space"] == "global" else (b["sym"], b["pool_off"] + disp)
+        r = self.mat(Lin(off.t))
+        key = ("addr", buf, r)
+        if key not in self.memo:
+            if b["space"] == "global":
+                w, a = self.new("rd"), self.new("rd")
+                self.emit(f"mul.wide.{'u' if r in self.nn else 's'}32 {w}, {r}, {eb};")
+                self.emit(f"add.s64 {a}, {b['base']}, {w};")
+            else:
+                a = self.new("r")
+                self.emit(f"mad.lo.s32 {a}, {r}, {eb}, {self.smem_base(buf)};")
+            self.memo[key] = a
+        return self.memo[key], disp
 
     def smem_base(self, buf: str) -> str:
         return self.bufs[buf]["reg"]     # set in the prologue: valid on every path
@@ -381,6 +486,7 @@ class Kernel:
         self.comment(f"Tile[{', '.join(a.name for a in s.axes)}] (N={n})")
         gid = self.new("r")
         self.emit(f"mad.lo.s32 {gid}, {self.ctaid}, {self.ntid}, {self.tid};")
+        self.nn.add(gid)
         end = self.label("tile_end")
         if n < math.prod(self.launch["grid"]) * math.prod(self.launch["block"]):
             p = self.new("p")
@@ -536,19 +642,38 @@ class Kernel:
                 for m in mine:
                     del self.acc_owner[m]
                 return
-        i, p = self.new("r"), self.new("p")
-        top, done = self.label(f"{var}_top"), self.label(f"{var}_end")
+        i = self.new("r")
         self.emit(f"mov.s32 {i}, {start};")
-        self.lines.append(f"{top}:")
-        self.emit(f"setp.ge.s32 {p}, {i}, {end};")
-        self.emit(f"@{p} bra {done};")
         self.bind(var, i, "r")
-        self.visit(body)
-        self.emit(f"add.s32 {i}, {i}, {step};")
-        self.emit(f"bra.uni {top};")
-        self.lines.append(f"{done}:")
+        if self.isnn(start) and is_imm(step) and int(step) > 0:
+            self.nn.add(i)
+        if is_imm(end) and is_imm(step) and int(step) > 0 and self.unrollable(body):
+            # u copies per trip keep u loads in flight; same order, so same float results
+            u = RUNTIME_UNROLL
+            self.counted(var, i, str(int(end) - (u - 1) * int(step)), int(step), body, u)
+        self.counted(var, i, end, step, body, 1)      # the remainder (or the whole loop)
+        self.linv.pop(var, None)
         for m in mine:
             del self.acc_owner[m]
+
+    def counted(self, var, i, limit, step, body, u) -> None:
+        """while (i < limit) { body(var = i), ..., body(var = i + (u-1)*step); i += u*step }"""
+        p, top, done = self.new("p"), self.label(f"{var}_top"), self.label(f"{var}_end")
+        self.lines.append(f"{top}:")
+        self.emit(f"setp.ge.s32 {p}, {i}, {limit};")
+        self.emit(f"@{p} bra {done};")
+        with self.scope():
+            for k in range(u):      # var as an affine form: copies differ only in displacements
+                self.linv[var] = Lin({i: 1}, k * int(step))
+                self.visit(body)
+        self.emit(f"add.s32 {i}, {i}, {u * int(step) if u > 1 else step};")
+        self.emit(f"bra.uni {top};")
+        self.lines.append(f"{done}:")
+
+    def unrollable(self, body) -> bool:
+        flat = ("Loop", "StridedLoop", "Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait",
+                "WarpShuffle", "TreeHalve")
+        return self.size(body) <= 32 and not any(type(s).__name__ in flat for s in body)
 
     def size(self, body) -> int:
         n = 0
@@ -568,11 +693,13 @@ class Kernel:
             return
         other, done = self.label("else"), self.label("endif")
         self.emit(f"@!{p} bra {other if s.else_body else done};")
-        self.visit(s.body)
+        with self.scope():
+            self.visit(s.body)
         if s.else_body:
             self.emit(f"bra.uni {done};")
             self.lines.append(f"{other}:")
-            self.visit(s.else_body)
+            with self.scope():
+                self.visit(s.else_body)
         self.lines.append(f"{done}:")
 
     def s_Sync(self, s) -> None:
@@ -615,17 +742,16 @@ class Kernel:
             p, skip = self.new("p"), self.label("tree_skip")
             self.emit(f"setp.ge.s32 {p}, {tid}, {half};")
             self.emit(f"@{p} bra {skip};")
-            other, _ = self.iop("+", tid, str(half))
-            for buf, st, sb in zip(s.bufs, s.state, s.state_b):
-                b, d = self.address(buf, tid)
-                self.emit(f"ld.shared.f32 {self.dest(st)}, {self.at(b, d)};")
-                b, d = self.address(buf, other)
-                self.emit(f"ld.shared.f32 {self.dest(sb)}, {self.at(b, d)};")
-            for a in s.combine_states:
-                self.s_Assign(a, comment=False)
-            for buf, st in zip(s.bufs, s.state):
-                b, d = self.address(buf, tid)
-                self.emit(f"st.shared.f32 {self.at(b, d)}, {self.val(st)};")
+            with self.scope():
+                for buf, st, sb in zip(s.bufs, s.state, s.state_b):
+                    b, d = self.address(buf, tid)
+                    self.emit(f"ld.shared.f32 {self.dest(st)}, {self.at(b, d)};")
+                    self.emit(f"ld.shared.f32 {self.dest(sb)}, {self.at(b, d + 4 * half)};")
+                for a in s.combine_states:
+                    self.s_Assign(a, comment=False)
+                for buf, st in zip(s.bufs, s.state):
+                    b, d = self.address(buf, tid)
+                    self.emit(f"st.shared.f32 {self.at(b, d)}, {self.val(st)};")
             self.lines.append(f"{skip}:")
             self.emit(sync)
             half //= 2
@@ -640,7 +766,7 @@ class Kernel:
         shape = self.bufs[s.smem]["shape"]
         off = self.offset(s.smem_index, shape)
         if s.lane_index:
-            off, _ = self.iop("+", off, self.offset(s.lane_index, shape))
+            off = off + self.offset(s.lane_index, shape)
         sb, sd = self.address(s.smem, off)
         gb, gd = self.address(s.src, self.offset(s.src_index, self.bufs[s.src]["shape"]))
         cache = "cg" if s.nbytes == 16 else "ca"
@@ -696,6 +822,7 @@ class Kernel:
             prologue.append(f"\tmov.u32 {r}, {b['sym']};")
             if b["pool_off"]:
                 prologue.append(f"\tadd.s32 {r}, {r}, {b['pool_off']};")
+        self.nn.update((self.tid, self.ntid, self.ctaid, lane, warp))
         self.bind("lane", lane, "r")
         self.bind("warp", warp, "r")
         self.bind("tid", self.tid, "r")

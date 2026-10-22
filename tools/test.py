@@ -75,26 +75,32 @@ class Gpu:
         self.check(self.cu.cuMemcpyDtoH_v2(ctypes.c_void_p(out.ctypes.data), p, ctypes.c_size_t(out.nbytes)), "cuMemcpyDtoH")
         return out
 
-    def launch(self, fn, k, ptrs):
+    def launch(self, fn, k, ptrs, sync=True):
         params = (ctypes.c_void_p * len(ptrs))(*[ctypes.cast(ctypes.byref(p), ctypes.c_void_p) for p in ptrs])
         g, b = k["grid"], k["block"]
         self.check(self.cu.cuLaunchKernel(fn, g[0], g[1], g[2], b[0], b[1], b[2], k["smem_bytes"],
                                           None, params, None), "cuLaunchKernel")
-        self.check(self.cu.cuCtxSynchronize(), "kernel execution")
+        if sync:
+            self.check(self.cu.cuCtxSynchronize(), "kernel execution")
 
-    def time_us(self, fn, k, ptrs, iters=20) -> float:
+    def time_us(self, fn, k, ptrs, iters=50, reps=5) -> float:
+        """Median over `reps` of the mean time of `iters` back-to-back launches (after warmup)."""
         start, stop = ctypes.c_void_p(), ctypes.c_void_p()
         self.cu.cuEventCreate(ctypes.byref(start), 0)
         self.cu.cuEventCreate(ctypes.byref(stop), 0)
+        for _ in range(200):     # warm up long enough for a laptop GPU to reach its boost clock
+            self.launch(fn, k, ptrs, sync=False)
+        self.check(self.cu.cuCtxSynchronize(), "warmup")
         times = []
-        for _ in range(iters):
+        for _ in range(reps):
             self.cu.cuEventRecord(start, None)
-            self.launch(fn, k, ptrs)
+            for _ in range(iters):
+                self.launch(fn, k, ptrs, sync=False)
             self.cu.cuEventRecord(stop, None)
             self.cu.cuEventSynchronize(stop)
             ms = ctypes.c_float()
             self.cu.cuEventElapsedTime(ctypes.byref(ms), start, stop)
-            times.append(ms.value * 1000)
+            times.append(ms.value * 1000 / iters)
         return statistics.median(times)
 
 
@@ -171,13 +177,22 @@ def worker(pdir: Path, with_ref: bool) -> dict:
             for n, p in zip(k["arg_order"], ptrs):
                 if n in outs:
                     produced[n] = gpu.read(p, arrs[n])
-            row["us"] += gpu.time_us(fn, k, ptrs)
+            ref_fn = None
             if with_ref and (pdir / f"{k['entry']}.ref.cu").exists():
                 try:    # the reference only feeds the speed ratio; its build failing is not ours
-                    ref_total += ref_time(gpu, pdir / f"{k['entry']}.ref.cu", k, ptrs, tmp)
+                    ref_fn = gpu.function(nvrtc_cubin((pdir / f"{k['entry']}.ref.cu").read_text()),
+                                          k["entry"], k["smem_bytes"])
                 except RuntimeError as e:
                     row["error"] = "ref timing skipped: " + str(e)[:80]
                     ref_total, with_ref = 0.0, False
+            # interleave ours and the reference, best of 3: GPU clock drift hits both alike
+            ours, refs = [], []
+            for _ in range(3 if ref_fn else 1):
+                ours.append(gpu.time_us(fn, k, ptrs))
+                if ref_fn:
+                    refs.append(gpu.time_us(ref_fn, k, ptrs))
+            row["us"] += min(ours)
+            ref_total += min(refs) if refs else 0.0
         except RuntimeError as e:
             row.update(passed=False, error=str(e)[:120])
             return row
@@ -213,10 +228,6 @@ def nvrtc_cubin(src: str) -> bytes:
     buf = ctypes.create_string_buffer(n.value)
     lib.nvrtcGetCUBIN(prog, buf)
     return buf.raw
-
-
-def ref_time(gpu, cu: Path, k, ptrs, tmp) -> float:
-    return gpu.time_us(gpu.function(nvrtc_cubin(cu.read_text()), k["entry"], k["smem_bytes"]), k, ptrs)
 
 
 def remote(pdir: Path) -> dict:
