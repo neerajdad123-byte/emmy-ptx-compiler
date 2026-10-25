@@ -29,7 +29,7 @@ from emmy.compiler.graph import Graph
 PTX_VERSION, TARGET = "8.0", "sm_89"
 STATIC_SMEM_LIMIT = 48 * 1024           # above this, shared arrays live in one dynamic pool
 RUNTIME_UNROLL = 4                      # copies per trip of a small runtime loop
-UNROLL_LIMIT = 4096                     # max statements emitted when honoring Loop.unroll
+UNROLL_LIMIT = 8192                     # max statements emitted when honoring Loop.unroll
 SMEM_BYTES = {"float": 4, "f32": 4}
 LOG2E, LN2 = "0f3FB8AA3B", "0f3F317218"
 
@@ -139,6 +139,7 @@ class Kernel:
         self.memo: dict = {}              # value numbering: (op, a, b) -> register
         self.nn: set[str] = set()         # integer registers known to be >= 0
         self.linv: dict[str, Lin] = {}    # loop variables bound to an affine form
+        self.guard: str | None = None     # predicate prefixed to every emitted instruction
 
     # ---- small helpers ---------------------------------------------------
     def new(self, k: str) -> str:
@@ -150,7 +151,7 @@ class Kernel:
         return f"$L{self.nlabel}_{hint}"
 
     def emit(self, s: str) -> None:
-        self.lines.append("\t" + s)
+        self.lines.append("\t" + (f"@{self.guard} " if self.guard else "") + s)
 
     def comment(self, s: str) -> None:
         self.lines.append("\t// " + s.encode("ascii", "replace").decode())
@@ -163,7 +164,8 @@ class Kernel:
         """Register for a value being (re)defined: reuse the name's register so loop-carried
         redefinitions (accumulators, shuffle ladders) update in place."""
         r = self.env.get(name)
-        if r is None or is_imm(r) or self.kind[name] != k:
+        # under a guard, a reused register would be a partial definition ptxas cannot rename
+        if r is None or is_imm(r) or self.kind[name] != k or self.guard:
             r = self.new(k)
             self.bind(name, r, k)
         return r
@@ -648,10 +650,33 @@ class Kernel:
         if self.isnn(start) and is_imm(step) and int(step) > 0:
             self.nn.add(i)
         if is_imm(end) and is_imm(step) and int(step) > 0 and self.unrollable(body):
-            # u copies per trip keep u loads in flight; same order, so same float results
-            u = RUNTIME_UNROLL
-            self.counted(var, i, str(int(end) - (u - 1) * int(step)), int(step), body, u)
-        self.counted(var, i, end, step, body, 1)      # the remainder (or the whole loop)
+            # u copies per trip keep u loads in flight; same order, so same float results.
+            # The trips % u leftovers run FIRST (as nvcc does): left at the end, their loads
+            # would wait behind every add of the wide loop (in-order issue), one more round trip.
+            u, st = RUNTIME_UNROLL, int(step)
+            left, _ = self.iop("max", self.iop("+", self.iop("-", end, i)[0], str(st - 1))[0], "0")
+            self.nn.add(left)
+            trips, _ = self.iop("/", left, str(st))
+            pre, _ = self.iop("%", trips, str(u))
+            if self.predicable(body):
+                # one predicated group, copy k runs iff k < pre: straight-line code, so ptxas can
+                # issue all its loads at once instead of one loop round trip per leftover
+                # copy k's guard implies every earlier one's, so values they numbered are valid
+                with self.scope():
+                    for k in range(u - 1):
+                        g = self.new("p")
+                        self.emit(f"setp.gt.s32 {g}, {pre}, {k};")
+                        self.guard, self.linv[var] = g, Lin({i: 1}, k * st)
+                        self.visit(body)
+                        self.guard = None
+                self.emit(f"mad.lo.s32 {i}, {pre}, {st}, {i};")
+                self.forget(i)
+            else:
+                peel_end, _ = self.iop("+", i, self.iop("*", pre, str(st))[0])
+                self.counted(var, i, peel_end, step, body, 1)
+            self.counted(var, i, end, st, body, u)     # whole groups of u remain
+        else:
+            self.counted(var, i, end, step, body, 1)
         self.linv.pop(var, None)
         for m in mine:
             del self.acc_owner[m]
@@ -669,6 +694,17 @@ class Kernel:
         self.emit(f"add.s32 {i}, {i}, {u * int(step) if u > 1 else step};")
         self.emit(f"bra.uni {top};")
         self.lines.append(f"{done}:")
+        self.forget(i)
+
+    def forget(self, r: str) -> None:
+        """Drop numbered values computed from register r, which was just modified in place."""
+        self.memo = {k: v for k, v in self.memo.items() if r not in k}
+
+    def predicable(self, body) -> bool:
+        """Every instruction of the body can take an @p guard: no branches or own predicates."""
+        return not any(type(s).__name__ == "Cond" or
+                       type(s).__name__ in ("Assign", "Accum") and s.op.name in ("power", "pow")
+                       for s in body)
 
     def unrollable(self, body) -> bool:
         flat = ("Loop", "StridedLoop", "Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait",
