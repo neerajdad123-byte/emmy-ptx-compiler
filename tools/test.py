@@ -205,9 +205,9 @@ def worker(pdir: Path, with_ref: bool) -> dict:
     return row
 
 
-def nvrtc_cubin(src: str) -> bytes:
-    """Build emmy's reference CUDA with NVRTC (no host compiler needed). Metrics only:
-    the reference is never part of compile.py's output."""
+def nvrtc_cubin(src: str, ptx: bool = False) -> bytes:
+    """Build emmy's reference CUDA with NVRTC (no host compiler needed): a cubin, or PTX for the
+    hosted runner. Metrics only: the reference is never part of compile.py's output."""
     import glob
     import shutil
     bindir = Path(shutil.which("ptxas")).parent
@@ -216,7 +216,7 @@ def nvrtc_cubin(src: str) -> bytes:
     lib = ctypes.WinDLL(dll) if sys.platform == "win32" else ctypes.CDLL(dll)
     prog = ctypes.c_void_p()
     lib.nvrtcCreateProgram(ctypes.byref(prog), src.encode(), b"ref.cu", 0, None, None)
-    opts = (ctypes.c_char_p * 2)(b"-arch=sm_89", b"-default-device")
+    opts = (ctypes.c_char_p * 2)(b"-arch=compute_89" if ptx else b"-arch=sm_89", b"-default-device")
     if lib.nvrtcCompileProgram(prog, 2, opts):
         n = ctypes.c_size_t()
         lib.nvrtcGetProgramLogSize(prog, ctypes.byref(n))
@@ -224,9 +224,11 @@ def nvrtc_cubin(src: str) -> bytes:
         lib.nvrtcGetProgramLog(prog, log)
         raise RuntimeError("nvrtc: " + log.value.decode(errors="replace")[:200])
     n = ctypes.c_size_t()
-    lib.nvrtcGetCUBINSize(prog, ctypes.byref(n))
+    (lib.nvrtcGetPTXSize if ptx else lib.nvrtcGetCUBINSize)(prog, ctypes.byref(n))
     buf = ctypes.create_string_buffer(n.value)
-    lib.nvrtcGetCUBIN(prog, buf)
+    (lib.nvrtcGetPTX if ptx else lib.nvrtcGetCUBIN)(prog, buf)
+    if ptx:
+        return buf.value
     return buf.raw
 
 
